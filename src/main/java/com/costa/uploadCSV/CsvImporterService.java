@@ -16,12 +16,15 @@ import okhttp3.OkHttpClient;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
-import java.sql.*;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
-import java.util.concurrent.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 
@@ -34,12 +37,27 @@ public class CsvImporterService {
     private static final int THREAD_POOL_SIZE = 4;
     private static final int MAX_RETRIES = 3;
     private static final long RETRY_DELAY_MS = 2000;
-    private static final long LARGE_FILE_THRESHOLD = 500 * 1024 * 1024;
+    private static final long LARGE_FILE_THRESHOLD = 500 * 1024 * 1024; // 500 MB
     private static final int BATCH_SIZE = 5000;
+    private static final long MIN_ROW_COUNT_THRESHOLD = 1000; // Assume processed if table has >= 1000 rows
 
     public CsvImporterService(JdbcTemplate jdbcTemplate, MinioCsvService minioCsvService) {
         this.jdbcTemplate = jdbcTemplate;
         this.minioCsvService = minioCsvService;
+    }
+
+    private boolean isTableProcessed(String tableName, String objectName) {
+        // Check if table exists
+        String checkSql = "SELECT to_regclass(?)";
+        String exists = jdbcTemplate.queryForObject(checkSql, new Object[]{tableName}, String.class);
+        if (exists == null) {
+            return false; // Table doesn't exist, not processed
+        }
+
+        // Check if table has significant rows
+        String countSql = "SELECT COUNT(*) FROM \"" + tableName + "\"";
+        Long rowCount = jdbcTemplate.queryForObject(countSql, Long.class);
+        return rowCount != null && rowCount >= MIN_ROW_COUNT_THRESHOLD;
     }
 
     @PostConstruct
@@ -69,10 +87,10 @@ public class CsvImporterService {
                         Item item = result.get();
                         String objectName = item.objectName();
                         if (!objectName.toLowerCase().endsWith(".csv")) return null;
-                        long size = minioClient.statObject(
+                        var stat = minioClient.statObject(
                                 StatObjectArgs.builder().bucket(minioCsvService.getBucket()).object(objectName).build()
-                        ).size();
-                        return new FileInfo(objectName, size);
+                        );
+                        return new FileInfo(objectName, stat.size());
                     } catch (Exception e) {
                         System.err.println("Error accessing object: " + e.getMessage());
                         return null;
@@ -89,10 +107,16 @@ public class CsvImporterService {
         ExecutorService executor = Executors.newFixedThreadPool(THREAD_POOL_SIZE);
 
         for (FileInfo fileInfo : csvFiles) {
+            String rawName = fileInfo.objectName.replaceFirst("(?i)\\.csv$", "");
+            String tableName = rawName.toLowerCase().replaceAll("[^a-z0-9_]", "_");
+            if (isTableProcessed(tableName, fileInfo.objectName)) {
+                System.out.printf("[%s] Skipping processed file (table exists with >= %d rows)%n", fileInfo.objectName, MIN_ROW_COUNT_THRESHOLD);
+                continue;
+            }
             if (fileInfo.size > LARGE_FILE_THRESHOLD) {
-                processFileWithRetries(fileInfo.objectName);
+                processFileWithRetries(fileInfo);
             } else {
-                executor.submit(() -> processFileWithRetries(fileInfo.objectName));
+                executor.submit(() -> processFileWithRetries(fileInfo));
             }
         }
 
@@ -109,18 +133,18 @@ public class CsvImporterService {
         System.out.println("Total time taken: " + totalTime + " ms");
     }
 
-    private void processFileWithRetries(String objectName) {
+    private void processFileWithRetries(FileInfo fileInfo) {
         int attempt = 0;
         while (attempt < MAX_RETRIES) {
             try {
-                importSingleFile(objectName);
+                importSingleFile(fileInfo);
                 break;
             } catch (Exception e) {
                 attempt++;
                 if (attempt == MAX_RETRIES) {
-                    System.err.println("Failed to import " + objectName + " after " + MAX_RETRIES + " attempts: " + e.getMessage());
+                    System.err.printf("[%s] Failed to import after %d attempts: %s%n", fileInfo.objectName, MAX_RETRIES, e.getMessage());
                 } else {
-                    System.err.printf("Retry %d for %s: %s%n", attempt, objectName, e.getMessage());
+                    System.err.printf("[%s] Retry %d: %s%n", fileInfo.objectName, attempt, e.getMessage());
                     try {
                         Thread.sleep(RETRY_DELAY_MS);
                     } catch (InterruptedException ie) {
@@ -132,19 +156,20 @@ public class CsvImporterService {
         }
     }
 
-    private void importSingleFile(String objectName) throws Exception {
+    private void importSingleFile(FileInfo fileInfo) throws Exception {
         long start = System.currentTimeMillis();
+        String objectName = fileInfo.objectName;
         String rawName = objectName.replaceFirst("(?i)\\.csv$", "");
         String tableName = rawName.toLowerCase().replaceAll("[^a-z0-9_]", "_");
 
-        System.out.println("\nImporting: " + objectName + " → Table: " + tableName);
+        System.out.printf("[%s] Importing to Table: %s%n", objectName, tableName);
 
         try (InputStreamReader isr = new InputStreamReader(minioCsvService.getCsvFile(objectName), StandardCharsets.ISO_8859_1);
              BufferedReader reader = new BufferedReader(isr, 8192 * 4)) {
 
             String headerLine = reader.readLine();
             if (headerLine == null) {
-                System.out.println("Skipping empty file: " + objectName);
+                System.out.printf("[%s] Skipping empty file%n", objectName);
                 return;
             }
 
@@ -153,10 +178,10 @@ public class CsvImporterService {
                     .map(h -> h.replaceAll("^\"|\"$", "").toLowerCase())
                     .filter(h -> !h.isEmpty())
                     .collect(Collectors.toList());
-            System.out.println("Cleaned headers (lowercase): " + headers);
+            System.out.printf("[%s] Cleaned headers (lowercase): %s%n", objectName, headers);
 
             if (headers.isEmpty()) {
-                System.out.println("Skipping file with invalid headers: " + objectName);
+                System.out.printf("[%s] Skipping file with invalid headers%n", objectName);
                 return;
             }
 
@@ -164,61 +189,66 @@ public class CsvImporterService {
 
             String columnsList = headers.stream().map(h -> "\"" + h + "\"").collect(Collectors.joining(", "));
             String placeholders = headers.stream().map(h -> "?").collect(Collectors.joining(", "));
-            String checkWhereClause = headers.stream().map(h -> "\"" + h + "\" = ?").collect(Collectors.joining(" AND "));
-
-            String selectSQL = "SELECT COUNT(*) FROM \"" + tableName + "\" WHERE " + checkWhereClause;
-            String insertSQL = "INSERT INTO \"" + tableName + "\" (" + columnsList + ") VALUES (" + placeholders + ")";
+            String insertSQL = "INSERT INTO \"" + tableName + "\" (" + columnsList + ") VALUES (" + placeholders + ") ON CONFLICT DO NOTHING";
 
             try (Connection conn = jdbcTemplate.getDataSource().getConnection()) {
                 conn.setAutoCommit(false);
 
-                try (CSVParser parser = new CSVParser(reader, CSVFormat.DEFAULT.withHeader(headers.toArray(new String[0])).withSkipHeaderRecord().withTrim());
-                     PreparedStatement checkStmt = conn.prepareStatement(selectSQL);
+                try (CSVParser parser = new CSVParser(reader, CSVFormat.DEFAULT.withHeader(headers.toArray(new String[0])).withSkipHeaderRecord().withTrim().withAllowMissingColumnNames());
                      PreparedStatement insertStmt = conn.prepareStatement(insertSQL)) {
 
                     int inserted = 0, skipped = 0, batchCount = 0;
+                    long lineNumber = 1; // Start after header
 
                     for (CSVRecord record : parser) {
-                        for (int i = 0; i < headers.size(); i++) {
-                            checkStmt.setString(i + 1, record.get(i));
+                        lineNumber++;
+                        // Check if record has the correct number of fields
+                        if (record.size() < headers.size()) {
+                            System.out.printf("[%s] ❌ Skipped line %d due to missing data: %s%n", objectName, lineNumber, record.toString());
+                            skipped++;
+                            continue;
                         }
 
-                        try (ResultSet rs = checkStmt.executeQuery()) {
-                            rs.next();
-                            if (rs.getInt(1) == 0) {
-                                for (int i = 0; i < headers.size(); i++) {
-                                    insertStmt.setString(i + 1, record.get(i));
+                        try {
+                            for (int i = 0; i < headers.size(); i++) {
+                                String value = record.get(i);
+                                // Clean invalid characters (e.g., 0x91)
+                                if (value != null) {
+                                    value = new String(value.getBytes(StandardCharsets.UTF_8), StandardCharsets.UTF_8);
+                                    value = value.replaceAll("[\\x00-\\x1F\\x7F\\x91]", "");
                                 }
-                                insertStmt.addBatch();
-                                batchCount++;
-
-                                if (batchCount >= BATCH_SIZE) {
-                                    insertStmt.executeBatch();
-                                    conn.commit();
-                                    inserted += batchCount;
-                                    System.out.printf("✅ Batch executed: Size=%d, Total Inserted=%d%n", BATCH_SIZE, inserted);
-                                    batchCount = 0;
-                                }
-                            } else {
-                                skipped++;
+                                insertStmt.setString(i + 1, value);
                             }
+                            insertStmt.addBatch();
+                            batchCount++;
+
+                            if (batchCount >= BATCH_SIZE) {
+                                int[] results = insertStmt.executeBatch();
+                                conn.commit();
+                                inserted += Arrays.stream(results).sum();
+                                System.out.printf("[%s] ✅ Batch executed: Size=%d, Total Inserted=%d, Skipped=%d%n", objectName, batchCount, inserted, skipped);
+                                batchCount = 0;
+                            }
+                        } catch (Exception e) {
+                            System.out.printf("[%s] ❌ Skipped line %d due to error: %s | Error: %s%n", objectName, lineNumber, record.toString(), e.getMessage());
+                            skipped++;
                         }
                     }
 
                     if (batchCount > 0) {
-                        insertStmt.executeBatch();
+                        int[] results = insertStmt.executeBatch();
                         conn.commit();
-                        inserted += batchCount;
-                        System.out.printf("✅ Final Batch executed: Size=%d, Total Inserted=%d%n", batchCount, inserted);
+                        inserted += Arrays.stream(results).sum();
+                        System.out.printf("[%s] ✅ Final Batch executed: Size=%d, Total Inserted=%d, Skipped=%d%n", objectName, batchCount, inserted, skipped);
                     }
 
                     long duration = System.currentTimeMillis() - start;
-                    System.out.printf("Finished importing %s → Inserted: %d records | Skipped: %d records | Time: %d ms%n",
+                    System.out.printf("[%s] Finished importing → Inserted: %d records, Skipped: %d records, Time: %d ms%n",
                             objectName, inserted, skipped, duration);
 
                 } catch (Exception e) {
                     conn.rollback();
-                    throw new Exception("Transaction rolled back for " + objectName + ": " + e.getMessage(), e);
+                    throw new Exception(String.format("[%s] Transaction rolled back: %s", objectName, e.getMessage()), e);
                 } finally {
                     conn.setAutoCommit(true);
                 }
@@ -236,7 +266,7 @@ public class CsvImporterService {
                         headers.stream().map(h -> "\"" + h + "\" TEXT").collect(Collectors.joining(", ")) +
                         ")";
                 jdbcTemplate.execute(createSql);
-                System.out.println("Created table: " + tableName);
+                System.out.printf("Created table: %s%n", tableName);
             }
         }
     }
